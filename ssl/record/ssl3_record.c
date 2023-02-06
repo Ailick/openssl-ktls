@@ -186,6 +186,7 @@ int ssl3_get_record(SSL *s)
     size_t num_recs = 0, max_recs, j;
     PACKET pkt, sslv2pkt;
     size_t first_rec_len;
+    int using_ktls;
 
     rr = RECORD_LAYER_get_rrec(&s->rlayer);
     rbuf = RECORD_LAYER_get_rbuf(&s->rlayer);
@@ -193,6 +194,12 @@ int ssl3_get_record(SSL *s)
     if (max_recs == 0)
         max_recs = 1;
     sess = s->session;
+
+    /*
+     * KTLS reads full records. If there is any data left,
+     * then it is from before enabling ktls.
+     */
+    using_ktls = BIO_get_ktls_recv(s->rbio) && SSL3_BUFFER_get_left(rbuf) == 0;
 
     do {
         thisrr = &rr[num_recs];
@@ -207,8 +214,32 @@ int ssl3_get_record(SSL *s)
             rret = ssl3_read_n(s, SSL3_RT_HEADER_LENGTH,
                                SSL3_BUFFER_get_len(rbuf), 0,
                                num_recs == 0 ? 1 : 0, &n);
-            if (rret <= 0)
-                return rret;     /* error or non-blocking */
+            if (rret <= 0) {
+#ifndef OPENSSL_NO_KTLS
+                if (!BIO_get_ktls_recv(s->rbio) || rret == 0)
+                    return rret;     /* error or non-blocking */
+                switch (errno) {
+                case EBADMSG:
+                    SSLfatal(s, SSL_AD_BAD_RECORD_MAC,
+                             SSL_F_SSL3_GET_RECORD,
+                             SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC);
+                    break;
+                case EMSGSIZE:
+                    SSLfatal(s, SSL_AD_RECORD_OVERFLOW,
+                             SSL_F_SSL3_GET_RECORD,
+                             SSL_R_PACKET_LENGTH_TOO_LONG);
+                    break;
+                case EINVAL:
+                    SSLfatal(s, SSL_AD_PROTOCOL_VERSION,
+                             SSL_F_SSL3_GET_RECORD,
+                             SSL_R_WRONG_VERSION_NUMBER);
+                    break;
+                default:
+                    break;
+                }
+#endif
+                return rret;
+            }
             RECORD_LAYER_set_rstate(&s->rlayer, SSL_ST_READ_BODY);
 
             p = RECORD_LAYER_get_packet(&s->rlayer);
@@ -339,7 +370,9 @@ int ssl3_get_record(SSL *s)
                     }
                 }
 
-                if (SSL_IS_TLS13(s) && s->enc_read_ctx != NULL) {
+                if (SSL_IS_TLS13(s)
+                        && s->enc_read_ctx != NULL
+                        && !using_ktls) {
                     if (thisrr->type != SSL3_RT_APPLICATION_DATA
                             && (thisrr->type != SSL3_RT_CHANGE_CIPHER_SPEC
                                 || !SSL_IS_FIRST_HANDSHAKE(s))
@@ -369,7 +402,13 @@ int ssl3_get_record(SSL *s)
         }
 
         if (SSL_IS_TLS13(s)) {
-            if (thisrr->length > SSL3_RT_MAX_TLS13_ENCRYPTED_LENGTH) {
+            size_t len = SSL3_RT_MAX_TLS13_ENCRYPTED_LENGTH;
+
+            /* KTLS strips the inner record type. */
+            if (using_ktls)
+                len = SSL3_RT_MAX_ENCRYPTED_LENGTH;
+
+            if (thisrr->length > len) {
                 SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_F_SSL3_GET_RECORD,
                          SSL_R_ENCRYPTED_LENGTH_TOO_LONG);
                 return -1;
@@ -385,6 +424,10 @@ int ssl3_get_record(SSL *s)
             if (s->expand == NULL)
                 len -= SSL3_RT_MAX_COMPRESSED_OVERHEAD;
 #endif
+
+            /* KTLS may use all of the buffer */
+            if (using_ktls)
+                len = SSL3_BUFFER_get_left(rbuf);
 
             if (thisrr->length > len) {
                 SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_F_SSL3_GET_RECORD,
@@ -404,6 +447,7 @@ int ssl3_get_record(SSL *s)
         } else {
             more = thisrr->length;
         }
+
         if (more > 0) {
             /* now s->rlayer.packet_length == SSL3_RT_HEADER_LENGTH */
 
@@ -490,6 +534,9 @@ int ssl3_get_record(SSL *s)
 
         return 1;
     }
+
+    if (using_ktls)
+        goto skip_decryption;
 
     /*
      * If in encrypt-then-mac mode calculate mac from encrypted record. All
@@ -678,6 +725,8 @@ int ssl3_get_record(SSL *s)
         return -1;
     }
 
+ skip_decryption:
+
     for (j = 0; j < num_recs; j++) {
         thisrr = &rr[j];
 
@@ -698,22 +747,30 @@ int ssl3_get_record(SSL *s)
         if (SSL_IS_TLS13(s)
                 && s->enc_read_ctx != NULL
                 && thisrr->type != SSL3_RT_ALERT) {
-            size_t end;
+            /*
+             * The following logic are irrelevant in KTLS: the kernel provides
+             * unprotected record and thus record type represent the actual
+             * content type, and padding is already removed and thisrr->type and
+             * thisrr->length should have the correct values.
+             */
+            if (!using_ktls) {
+                size_t end;
 
-            if (thisrr->length == 0
-                    || thisrr->type != SSL3_RT_APPLICATION_DATA) {
-                SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_SSL3_GET_RECORD,
-                         SSL_R_BAD_RECORD_TYPE);
-                return -1;
+                if (thisrr->length == 0
+                        || thisrr->type != SSL3_RT_APPLICATION_DATA) {
+                    SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE,
+                             SSL_F_SSL3_GET_RECORD, SSL_R_BAD_RECORD_TYPE);
+                    return -1;
+                }
+
+                /* Strip trailing padding */
+                for (end = thisrr->length - 1; end > 0 && thisrr->data[end] == 0;
+                     end--)
+                    continue;
+
+                thisrr->length = end;
+                thisrr->type = thisrr->data[end];
             }
-
-            /* Strip trailing padding */
-            for (end = thisrr->length - 1; end > 0 && thisrr->data[end] == 0;
-                 end--)
-                continue;
-
-            thisrr->length = end;
-            thisrr->type = thisrr->data[end];
             if (thisrr->type != SSL3_RT_APPLICATION_DATA
                     && thisrr->type != SSL3_RT_ALERT
                     && thisrr->type != SSL3_RT_HANDSHAKE) {
@@ -723,7 +780,7 @@ int ssl3_get_record(SSL *s)
             }
             if (s->msg_callback)
                 s->msg_callback(0, s->version, SSL3_RT_INNER_CONTENT_TYPE,
-                                &thisrr->data[end], 1, s, s->msg_callback_arg);
+                                &thisrr->type, 1, s, s->msg_callback_arg);
         }
 
         /*
@@ -739,13 +796,25 @@ int ssl3_get_record(SSL *s)
             return -1;
         }
 
-        if (thisrr->length > SSL3_RT_MAX_PLAIN_LENGTH) {
+        /*
+         * Usually thisrr->length is the length of a single record, but when
+         * KTLS handles the decryption, thisrr->length may be larger than
+         * SSL3_RT_MAX_PLAIN_LENGTH because the kernel may have coalesced
+         * multiple records.
+         * Therefore we have to rely on KTLS to check the plaintext length
+         * limit in the kernel.
+         */
+        if (thisrr->length > SSL3_RT_MAX_PLAIN_LENGTH && !using_ktls) {
             SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_F_SSL3_GET_RECORD,
                      SSL_R_DATA_LENGTH_TOO_LONG);
             return -1;
         }
 
-        /* If received packet overflows current Max Fragment Length setting */
+        /*
+         * Check if the received packet overflows the current
+         * Max Fragment Length setting.
+         * Note: USE_MAX_FRAGMENT_LENGTH_EXT and KTLS are mutually exclusive.
+         */
         if (s->session != NULL && USE_MAX_FRAGMENT_LENGTH_EXT(s->session)
                 && thisrr->length > GET_MAX_FRAGMENT_LENGTH(s->session)) {
             SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_F_SSL3_GET_RECORD,

@@ -7,6 +7,7 @@
  * https://www.openssl.org/source/license.html
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <openssl/opensslconf.h>
@@ -17,12 +18,14 @@
 #include <openssl/srp.h>
 #include <openssl/txt_db.h>
 #include <openssl/aes.h>
+#include <openssl/rand.h>
 #include <openssl/x509v3.h>
 
 #include "ssltestlib.h"
 #include "testutil.h"
 #include "testutil/output.h"
 #include "internal/nelem.h"
+#include "internal/ktls.h"
 #include "../ssl/ssl_local.h"
 
 #ifndef OPENSSL_NO_TLS1_3
@@ -765,6 +768,433 @@ static int execute_test_large_message(const SSL_METHOD *smeth,
 
     return testresult;
 }
+
+#if !defined(OPENSSL_NO_SOCK) && !defined(OPENSSL_NO_KTLS) && \
+    !(defined(OPENSSL_NO_TLS1_3) && defined(OPENSSL_NO_TLS1_2))
+/* sock must be connected */
+static int ktls_chk_platform(int sock)
+{
+    if (!ktls_enable(sock))
+        return 0;
+    return 1;
+}
+
+static int ping_pong_query(SSL *clientssl, SSL *serverssl)
+{
+    static char count = 1;
+    unsigned char cbuf[16000] = {0};
+    unsigned char sbuf[16000];
+    size_t err = 0;
+    char crec_wseq_before[SEQ_NUM_SIZE];
+    char crec_wseq_after[SEQ_NUM_SIZE];
+    char crec_rseq_before[SEQ_NUM_SIZE];
+    char crec_rseq_after[SEQ_NUM_SIZE];
+    char srec_wseq_before[SEQ_NUM_SIZE];
+    char srec_wseq_after[SEQ_NUM_SIZE];
+    char srec_rseq_before[SEQ_NUM_SIZE];
+    char srec_rseq_after[SEQ_NUM_SIZE];
+
+    cbuf[0] = count++;
+    memcpy(crec_wseq_before, &clientssl->rlayer.write_sequence, SEQ_NUM_SIZE);
+    memcpy(crec_rseq_before, &clientssl->rlayer.read_sequence, SEQ_NUM_SIZE);
+    memcpy(srec_wseq_before, &serverssl->rlayer.write_sequence, SEQ_NUM_SIZE);
+    memcpy(srec_rseq_before, &serverssl->rlayer.read_sequence, SEQ_NUM_SIZE);
+
+    if (!TEST_true(SSL_write(clientssl, cbuf, sizeof(cbuf)) == sizeof(cbuf)))
+        goto end;
+
+    while ((err = SSL_read(serverssl, &sbuf, sizeof(sbuf))) != sizeof(sbuf)) {
+        if (SSL_get_error(serverssl, err) != SSL_ERROR_WANT_READ) {
+            goto end;
+        }
+    }
+
+    if (!TEST_true(SSL_write(serverssl, sbuf, sizeof(sbuf)) == sizeof(sbuf)))
+        goto end;
+
+    while ((err = SSL_read(clientssl, &cbuf, sizeof(cbuf))) != sizeof(cbuf)) {
+        if (SSL_get_error(clientssl, err) != SSL_ERROR_WANT_READ) {
+            goto end;
+        }
+    }
+
+    memcpy(crec_wseq_after, &clientssl->rlayer.write_sequence, SEQ_NUM_SIZE);
+    memcpy(crec_rseq_after, &clientssl->rlayer.read_sequence, SEQ_NUM_SIZE);
+    memcpy(srec_wseq_after, &serverssl->rlayer.write_sequence, SEQ_NUM_SIZE);
+    memcpy(srec_rseq_after, &serverssl->rlayer.read_sequence, SEQ_NUM_SIZE);
+
+    /* verify the payload */
+    if (!TEST_mem_eq(cbuf, sizeof(cbuf), sbuf, sizeof(sbuf)))
+        goto end;
+
+    /*
+     * If ktls is used then kernel sequences are used instead of
+     * OpenSSL sequences
+     */
+    if (!BIO_get_ktls_send(clientssl->wbio)) {
+        if (!TEST_mem_ne(crec_wseq_before, SEQ_NUM_SIZE,
+                         crec_wseq_after, SEQ_NUM_SIZE))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(crec_wseq_before, SEQ_NUM_SIZE,
+                         crec_wseq_after, SEQ_NUM_SIZE))
+            goto end;
+    }
+
+    if (!BIO_get_ktls_send(serverssl->wbio)) {
+        if (!TEST_mem_ne(srec_wseq_before, SEQ_NUM_SIZE,
+                         srec_wseq_after, SEQ_NUM_SIZE))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(srec_wseq_before, SEQ_NUM_SIZE,
+                         srec_wseq_after, SEQ_NUM_SIZE))
+            goto end;
+    }
+
+    if (!BIO_get_ktls_recv(clientssl->wbio)) {
+        if (!TEST_mem_ne(crec_rseq_before, SEQ_NUM_SIZE,
+                         crec_rseq_after, SEQ_NUM_SIZE))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(crec_rseq_before, SEQ_NUM_SIZE,
+                         crec_rseq_after, SEQ_NUM_SIZE))
+            goto end;
+    }
+
+    if (!BIO_get_ktls_recv(serverssl->wbio)) {
+        if (!TEST_mem_ne(srec_rseq_before, SEQ_NUM_SIZE,
+                         srec_rseq_after, SEQ_NUM_SIZE))
+            goto end;
+    } else {
+        if (!TEST_mem_eq(srec_rseq_before, SEQ_NUM_SIZE,
+                         srec_rseq_after, SEQ_NUM_SIZE))
+            goto end;
+    }
+
+    return 1;
+end:
+    return 0;
+}
+
+static int execute_test_ktls(int cis_ktls, int sis_ktls,
+                             int tls_version, const char *cipher)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    int ktls_used = 0, testresult = 0;
+    int cfd = -1, sfd = -1;
+    int rx_supported;
+
+    if (!TEST_true(create_test_sockets(&cfd, &sfd)))
+        goto end;
+
+    /* Skip this test if the platform does not support ktls */
+    if (!ktls_chk_platform(cfd)) {
+        TEST_info("Kernel does not support KTLS");
+        testresult = 1;
+        goto end;
+    }
+
+    /* Create a session based on SHA-256 */
+    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+                                       TLS_client_method(),
+                                       tls_version, tls_version,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    if (tls_version == TLS1_3_VERSION) {
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx, cipher))
+            || !TEST_true(SSL_CTX_set_ciphersuites(sctx, cipher)))
+            goto end;
+    } else {
+        if (!TEST_true(SSL_CTX_set_cipher_list(cctx, cipher))
+            || !TEST_true(SSL_CTX_set_cipher_list(sctx, cipher)))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_objects2(sctx, cctx, &serverssl,
+                                       &clientssl, sfd, cfd)))
+        goto end;
+
+    if (cis_ktls) {
+        if (!TEST_true(SSL_set_options(clientssl, SSL_OP_ENABLE_KTLS)))
+            goto end;
+    }
+
+    if (sis_ktls) {
+        if (!TEST_true(SSL_set_options(serverssl, SSL_OP_ENABLE_KTLS)))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+        goto end;
+
+    /*
+     * The running kernel may not support a given cipher suite
+     * or direction, so just check that KTLS isn't used when it
+     * isn't enabled.
+     */
+    if (!cis_ktls) {
+        if (!TEST_false(BIO_get_ktls_send(clientssl->wbio)))
+            goto end;
+    } else {
+        if (BIO_get_ktls_send(clientssl->wbio))
+            ktls_used = 1;
+    }
+
+    if (!sis_ktls) {
+        if (!TEST_false(BIO_get_ktls_send(serverssl->wbio)))
+            goto end;
+    } else {
+        if (BIO_get_ktls_send(serverssl->wbio))
+            ktls_used = 1;
+    }
+
+#if defined(OPENSSL_NO_KTLS_RX)
+    rx_supported = 0;
+#else
+    rx_supported = 1;
+#endif
+    if (!cis_ktls || !rx_supported) {
+        if (!TEST_false(BIO_get_ktls_recv(clientssl->rbio)))
+            goto end;
+    } else {
+        if (BIO_get_ktls_send(clientssl->rbio))
+            ktls_used = 1;
+    }
+
+    if (!sis_ktls || !rx_supported) {
+        if (!TEST_false(BIO_get_ktls_recv(serverssl->rbio)))
+            goto end;
+    } else {
+        if (BIO_get_ktls_send(serverssl->rbio))
+            ktls_used = 1;
+    }
+
+    if ((cis_ktls || sis_ktls) && !ktls_used) {
+        TEST_info("KTLS not supported for %s cipher %s",
+                  tls_version == TLS1_3_VERSION ? "TLS 1.3" :
+                  "TLS 1.2", cipher);
+        testresult = 1;
+        goto end;
+    }
+
+    if (!TEST_true(ping_pong_query(clientssl, serverssl)))
+        goto end;
+
+    testresult = 1;
+end:
+    if (clientssl) {
+        SSL_shutdown(clientssl);
+        SSL_free(clientssl);
+    }
+    if (serverssl) {
+        SSL_shutdown(serverssl);
+        SSL_free(serverssl);
+    }
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    serverssl = clientssl = NULL;
+    if (cfd != -1)
+        close(cfd);
+    if (sfd != -1)
+        close(sfd);
+    return testresult;
+}
+
+#define SENDFILE_SZ                     (16 * 4096)
+#define SENDFILE_CHUNK                  (4 * 4096)
+#define min(a,b)                        ((a) > (b) ? (b) : (a))
+
+static int execute_test_ktls_sendfile(int tls_version, const char *cipher)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    unsigned char *buf, *buf_dst;
+    BIO *out = NULL, *in = NULL;
+    int cfd = -1, sfd = -1, ffd, err;
+    ssize_t chunk_size = 0;
+    off_t chunk_off = 0;
+    int testresult = 0;
+    FILE *ffdp;
+
+    buf = OPENSSL_zalloc(SENDFILE_SZ);
+    buf_dst = OPENSSL_zalloc(SENDFILE_SZ);
+    if (!TEST_ptr(buf) || !TEST_ptr(buf_dst)
+        || !TEST_true(create_test_sockets(&cfd, &sfd)))
+        goto end;
+
+    /* Skip this test if the platform does not support ktls */
+    if (!ktls_chk_platform(sfd)) {
+        TEST_info("Kernel does not support KTLS");
+        testresult = 1;
+        goto end;
+    }
+
+    /* Create a session based on SHA-256 */
+    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+                                       TLS_client_method(),
+                                       tls_version, tls_version,
+                                       &sctx, &cctx, cert, privkey)))
+        goto end;
+
+    if (tls_version == TLS1_3_VERSION) {
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx, cipher))
+            || !TEST_true(SSL_CTX_set_ciphersuites(sctx, cipher)))
+            goto end;
+    } else {
+        if (!TEST_true(SSL_CTX_set_cipher_list(cctx, cipher))
+            || !TEST_true(SSL_CTX_set_cipher_list(sctx, cipher)))
+            goto end;
+    }
+
+    if (!TEST_true(create_ssl_objects2(sctx, cctx, &serverssl,
+                                       &clientssl, sfd, cfd)))
+        goto end;
+
+    if (!TEST_true(SSL_set_options(serverssl, SSL_OP_ENABLE_KTLS)))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+                                         SSL_ERROR_NONE)))
+        goto end;
+
+    if (!BIO_get_ktls_send(serverssl->wbio)) {
+        TEST_info("Failed to enable KTLS for %s cipher %s",
+                  tls_version == TLS1_3_VERSION ? "TLS 1.3" :
+                  "TLS 1.2", cipher);
+        testresult = 1;
+        goto end;
+    }
+
+    RAND_bytes(buf, SENDFILE_SZ);
+
+    out = BIO_new_file(tmpfilename, "wb");
+    if (!TEST_ptr(out))
+        goto end;
+
+    if (BIO_write(out, buf, SENDFILE_SZ) != SENDFILE_SZ)
+        goto end;
+
+    BIO_free(out);
+    out = NULL;
+    in = BIO_new_file(tmpfilename, "rb");
+    BIO_get_fp(in, &ffdp);
+    ffd = fileno(ffdp);
+
+    while (chunk_off < SENDFILE_SZ) {
+        chunk_size = min(SENDFILE_CHUNK, SENDFILE_SZ - chunk_off);
+        while ((err = SSL_sendfile(serverssl,
+                                   ffd,
+                                   chunk_off,
+                                   chunk_size,
+                                   0)) != chunk_size) {
+            if (SSL_get_error(serverssl, err) != SSL_ERROR_WANT_WRITE)
+                goto end;
+        }
+        while ((err = SSL_read(clientssl,
+                               buf_dst + chunk_off,
+                               chunk_size)) != chunk_size) {
+            if (SSL_get_error(clientssl, err) != SSL_ERROR_WANT_READ)
+                goto end;
+        }
+
+        /* verify the payload */
+        if (!TEST_mem_eq(buf_dst + chunk_off,
+                         chunk_size,
+                         buf + chunk_off,
+                         chunk_size))
+            goto end;
+
+        chunk_off += chunk_size;
+    }
+
+    testresult = 1;
+end:
+    if (clientssl) {
+        SSL_shutdown(clientssl);
+        SSL_free(clientssl);
+    }
+    if (serverssl) {
+        SSL_shutdown(serverssl);
+        SSL_free(serverssl);
+    }
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    serverssl = clientssl = NULL;
+    BIO_free(out);
+    BIO_free(in);
+    if (cfd != -1)
+        close(cfd);
+    if (sfd != -1)
+        close(sfd);
+    OPENSSL_free(buf);
+    OPENSSL_free(buf_dst);
+    return testresult;
+}
+
+static struct ktls_test_cipher {
+    int tls_version;
+    const char *cipher;
+} ktls_test_ciphers[] = {
+# if !defined(OPENSSL_NO_TLS1_2)
+#  ifdef OPENSSL_KTLS_AES_GCM_128
+    { TLS1_2_VERSION, "AES128-GCM-SHA256" },
+#  endif
+#  ifdef OPENSSL_KTLS_AES_CCM_128
+    { TLS1_2_VERSION, "AES128-CCM"},
+#  endif
+#  ifdef OPENSSL_KTLS_AES_GCM_256
+    { TLS1_2_VERSION, "AES256-GCM-SHA384"},
+#  endif
+#  ifdef OPENSSL_KTLS_CHACHA20_POLY1305
+    { TLS1_2_VERSION, "ECDHE-RSA-CHACHA20-POLY1305"},
+#  endif
+# endif
+# if !defined(OPENSSL_NO_TLS1_3)
+#  ifdef OPENSSL_KTLS_AES_GCM_128
+    { TLS1_3_VERSION, "TLS_AES_128_GCM_SHA256" },
+#  endif
+#  ifdef OPENSSL_KTLS_AES_CCM_128
+    { TLS1_3_VERSION, "TLS_AES_128_CCM_SHA256" },
+#  endif
+#  ifdef OPENSSL_KTLS_AES_GCM_256
+    { TLS1_3_VERSION, "TLS_AES_256_GCM_SHA384" },
+#  endif
+#  ifdef OPENSSL_KTLS_CHACHA20_POLY1305
+    { TLS1_3_VERSION, "TLS_CHACHA20_POLY1305_SHA256" },
+#  endif
+# endif
+};
+
+#define NUM_KTLS_TEST_CIPHERS \
+    (sizeof(ktls_test_ciphers) / sizeof(ktls_test_ciphers[0]))
+
+static int test_ktls(int test)
+{
+    struct ktls_test_cipher *cipher;
+    int cis_ktls, sis_ktls;
+
+    OPENSSL_assert(test / 4 < NUM_KTLS_TEST_CIPHERS);
+    cipher = &ktls_test_ciphers[test / 4];
+
+    cis_ktls = (test & 1) != 0;
+    sis_ktls = (test & 2) != 0;
+
+    return execute_test_ktls(cis_ktls, sis_ktls, cipher->tls_version,
+                             cipher->cipher);
+}
+
+static int test_ktls_sendfile(int tst)
+{
+    struct ktls_test_cipher *cipher;
+
+    OPENSSL_assert(tst < NUM_KTLS_TEST_CIPHERS);
+    cipher = &ktls_test_ciphers[tst];
+
+    return execute_test_ktls_sendfile(cipher->tls_version, cipher->cipher);
+}
+#endif
 
 static int test_large_message_tls(void)
 {
@@ -7170,6 +7600,12 @@ int setup_tests(void)
         return 0;
     }
 
+#if !defined(OPENSSL_NO_KTLS) && !defined(OPENSSL_NO_SOCK)
+# if !defined(OPENSSL_NO_TLS1_2) || !defined(OPENSSL_NO_TLS1_3)
+    ADD_ALL_TESTS(test_ktls, NUM_KTLS_TEST_CIPHERS * 4);
+    ADD_ALL_TESTS(test_ktls_sendfile, NUM_KTLS_TEST_CIPHERS);
+# endif
+#endif
     ADD_TEST(test_large_message_tls);
     ADD_TEST(test_large_message_tls_read_ahead);
 #ifndef OPENSSL_NO_DTLS
